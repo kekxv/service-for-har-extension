@@ -1,5 +1,5 @@
 document.addEventListener('DOMContentLoaded', () => {
-  // ... (UI Element selection is the same as before) ...
+  // ... (UI Element selection and other listeners remain the same) ...
   const globalToggle = document.getElementById('globalToggle');
   const globalStatus = document.getElementById('globalStatus');
   const uploadButton = document.getElementById('uploadButton');
@@ -32,7 +32,60 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // ... (Event Listeners for toggle, upload, search are the same as before) ...
+  // --- (Event listeners for toggle, upload, search are unchanged) ---
+  globalToggle.addEventListener('change', () => { /* ... */
+  });
+  uploadButton.addEventListener('click', () => { /* ... */
+  });
+  endpointSearch.addEventListener('input', (e) => { /* ... */
+  });
+
+  // --- (updateGlobalToggle is unchanged) ---
+  function updateGlobalToggle(isActive) { /* ... */
+  }
+
+  // [MODIFIED] This function is rewritten for the new UI
+  function updateFileListUI(files) {
+    fileList.innerHTML = '';
+    if (!files || files.length === 0) {
+      const li = document.createElement('li');
+      li.textContent = 'No HAR files loaded.';
+      li.style.padding = '8px 12px';
+      li.style.color = '#6c757d';
+      fileList.appendChild(li);
+      return;
+    }
+    files.forEach(fileInfo => {
+      const li = document.createElement('li');
+      li.className = 'file-item';
+
+      const span = document.createElement('span');
+      span.className = 'file-name';
+      span.textContent = fileInfo.filename;
+      span.title = fileInfo.filename; // Tooltip for long names
+
+      const deleteButton = document.createElement('button');
+      deleteButton.textContent = '🗑️';
+      deleteButton.className = 'btn-danger';
+      deleteButton.title = 'Delete this HAR';
+      deleteButton.onclick = () => {
+        if (confirm(`Are you sure you want to delete ${fileInfo.filename}?`)) {
+          chrome.runtime.sendMessage({type: 'deleteHar', id: fileInfo.id});
+        }
+      };
+
+      li.appendChild(span);
+      li.appendChild(deleteButton);
+      fileList.appendChild(li);
+    });
+  }
+
+  // --- (updateEndpointListUI is unchanged) ---
+  function updateEndpointListUI(endpoints) { /* ... */
+  }
+
+  // --- PASTE UNCHANGED FUNCTIONS HERE ---
+  // (For brevity, please ensure the full code for unchanged functions is present)
   globalToggle.addEventListener('change', () => {
     chrome.runtime.sendMessage({type: 'toggleGlobalReplay', active: globalToggle.checked});
   });
@@ -70,30 +123,6 @@ document.addEventListener('DOMContentLoaded', () => {
     globalStatus.style.color = isActive ? '#28a745' : '#dc3545';
   }
 
-  function updateFileListUI(files) {
-    fileList.innerHTML = '';
-    if (!files || files.length === 0) {
-      fileList.innerHTML = '<li>No HAR files loaded.</li>';
-      return;
-    }
-    files.forEach(fileInfo => {
-      const li = document.createElement('li');
-      li.innerHTML = `<span style="flex-grow: 1; overflow: hidden; text-overflow: ellipsis;" title="${fileInfo.filename}">${fileInfo.filename}</span>`;
-      const deleteButton = document.createElement('button');
-      deleteButton.textContent = '🗑️';
-      deleteButton.className = 'btn-danger';
-      deleteButton.title = 'Delete this HAR';
-      deleteButton.onclick = () => {
-        if (confirm(`Delete ${fileInfo.filename}?`)) {
-          chrome.runtime.sendMessage({type: 'deleteHar', id: fileInfo.id});
-        }
-      };
-      li.appendChild(deleteButton);
-      fileList.appendChild(li);
-    });
-  }
-
-  // [MODIFIED] This function now generates localhost:3000 links
   function updateEndpointListUI(endpoints) {
     endpointList.innerHTML = '';
     endpointHeader.textContent = `Loaded Endpoints (${endpoints ? endpoints.length : 0})`;
@@ -106,15 +135,10 @@ document.addEventListener('DOMContentLoaded', () => {
       const li = document.createElement('li');
       li.className = 'endpoint-item';
       li.setAttribute('data-search-term', `${ep.method.toLowerCase()} ${ep.path.toLowerCase()}`);
-
-      // The link is now a direct localhost link, opened in a new tab
       const pathUrl = `http://localhost:3000${ep.path}`;
-      li.innerHTML = `
-                <span class="method" style="background-color: ${methodColors[ep.method] || methodColors.OTHERS};">${ep.method}</span>
-                <a class="path" href="${pathUrl}" target="_blank" title="Preview in new tab: ${pathUrl}">${ep.path}</a>
-                <span class="count">${ep.count}</span>
-            `;
+      li.innerHTML = `<span class="method" style="background-color: ${methodColors[ep.method] || methodColors.OTHERS};">${ep.method}</span><a class="path" href="${pathUrl}" target="_blank" title="Preview in new tab: ${pathUrl}">${ep.path}</a><span class="count">${ep.count}</span>`;
       endpointList.appendChild(li);
     });
   }
+
 });

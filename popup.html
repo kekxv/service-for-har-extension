@@ -92,11 +92,6 @@
       list-style: none;
       padding: 0;
       margin: 0;
-      max-height: 200px;
-      overflow-y: auto;
-      border: 1px solid var(--border-color);
-      border-radius: 5px;
-      background-color: white;
     }
 
     button {
@@ -117,13 +112,6 @@
       background-color: #0069d9;
     }
 
-    .btn-danger {
-      background: none;
-      color: var(--danger);
-      padding: 0.25rem;
-      font-size: 1.2rem;
-    }
-
     .file-input-group {
       display: flex;
       gap: 0.5rem;
@@ -139,6 +127,59 @@
       margin-bottom: 0.5rem;
     }
 
+    /* [MODIFIED] File List Styles */
+    #fileList {
+      max-height: 200px;
+      overflow-y: auto;
+    }
+
+    .file-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      background-color: #ffffff;
+      border: 1px solid #e9ecef;
+      padding: 8px 12px;
+      border-radius: 6px;
+      margin-bottom: 5px;
+    }
+
+    .file-item:last-child {
+      margin-bottom: 0;
+    }
+
+    .file-item .file-name {
+      flex-grow: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
+      font-size: 0.9em;
+    }
+
+    .file-item .btn-danger {
+      flex-shrink: 0;
+      background: transparent;
+      border: none;
+      color: #6c757d;
+      font-size: 1.1rem;
+      cursor: pointer;
+      border-radius: 50%;
+      width: 30px;
+      height: 30px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background-color 0.2s, color 0.2s;
+    }
+
+    .file-item .btn-danger:hover {
+      background-color: #f8d7da;
+      color: #721c24;
+    }
+
+    /* [NO CHANGES] Endpoint List Styles */
     .endpoint-item {
       display: flex;
       align-items: center;
