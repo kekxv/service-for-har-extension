@@ -1,15 +1,18 @@
 {
   "manifest_version": 3,
-  "name": "HAR Replay DevTool",
-  "description": "Intercepts and replays network requests based on loaded HAR files.",
-  "version": "1.0",
+  "name": "HAR Replay (Global)",
+  "description": "Globally intercepts and replays network requests for all tabs based on loaded HAR files.",
+  "version": "2.2",
   "icons": {
-    "128": "icon128.png"
+    "16": "icon_off.png",
+    "48": "icon_off.png",
+    "128": "icon_off.png"
   },
   "permissions": [
     "debugger",
     "storage",
-    "activeTab"
+    "tabs",
+    "webNavigation"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -17,5 +20,18 @@
   "background": {
     "service_worker": "background.js"
   },
-  "devtools_page": "devtools.html"
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icon_off.png",
+      "48": "icon_off.png",
+      "128": "icon_off.png"
+    }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [ "loading.html" ],
+      "matches": [ "<all_urls>" ]
+    }
+  ]
 }

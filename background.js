@@ -1,35 +1,45 @@
-// --- 全局状态 ---
+// --- Global State ---
+let isReplayGloballyActive = false;
 let harDataMap = new Map();
-let loadedHars = []; // { id, filename }
-let activeTabs = new Map(); // tabId -> port
+let loadedHars = []; // Array of { id, filename }
 const debugTargets = new Set();
 const debuggerVersion = "1.3";
+const loadingUrl = chrome.runtime.getURL('loading.html');
 
-// --- 存储与状态管理 ---
-async function saveState() {
-  const dataResult = await chrome.storage.local.get('loadedHarsData');
-  const allHarData = dataResult.loadedHarsData || {};
+// State for the redirect-on-navigate interception trick
+const pendingNavigations = new Map();
+const navigationLock = new Set();
 
-  const updatedHarsData = {};
-  loadedHars.forEach(harInfo => {
-    if (allHarData[harInfo.id]) {
-      updatedHarsData[harInfo.id] = allHarData[harInfo.id];
-    }
-  });
 
-  await chrome.storage.local.set({
-    loadedHarsInfo: loadedHars.map(h => ({id: h.id, filename: h.filename})),
-    loadedHarsData: updatedHarsData
-  });
-}
+// --- State Management & HAR Processing ---
 
-async function loadState() {
-  const result = await chrome.storage.local.get(['loadedHarsInfo', 'loadedHarsData']);
+/**
+ * Loads the initial state from chrome.storage.local when the extension starts.
+ */
+async function loadInitialState() {
+  const result = await chrome.storage.local.get(['isReplayGloballyActive', 'loadedHarsInfo']);
+  isReplayGloballyActive = result.isReplayGloballyActive || false;
   loadedHars = result.loadedHarsInfo || [];
   await rebuildHarDataMap();
-  console.log("Initial state loaded from storage.");
+  await updateIcon();
+  if (isReplayGloballyActive) {
+    await attachToAllValidTabs();
+  }
 }
 
+/**
+ * Saves the array of loaded HAR file info to storage.
+ * The actual HAR data is saved/deleted separately to avoid overwriting.
+ */
+async function saveState() {
+  await chrome.storage.local.set({
+    loadedHarsInfo: loadedHars.map(h => ({id: h.id, filename: h.filename}))
+  });
+}
+
+/**
+ * Clears and rebuilds the in-memory harDataMap from all HAR data stored in chrome.storage.
+ */
 async function rebuildHarDataMap() {
   harDataMap.clear();
   const dataResult = await chrome.storage.local.get('loadedHarsData');
@@ -37,8 +47,7 @@ async function rebuildHarDataMap() {
 
   for (const harInfo of loadedHars) {
     const harJson = allHarData[harInfo.id];
-    if (!harJson) continue;
-    if (!harJson.log || !harJson.log.entries) continue;
+    if (!harJson || !harJson.log || !harJson.log.entries) continue;
 
     for (const entry of harJson.log.entries) {
       if (!entry?.request?.url || !entry.response) continue;
@@ -52,59 +61,245 @@ async function rebuildHarDataMap() {
         if (!pathMap.has(urlPath)) pathMap.set(urlPath, state);
         state.entries.push(entry);
       } catch (e) {
-        console.warn(`Skipping invalid entry in ${harInfo.filename}:`, entry.request.url, e.message);
+        console.warn(`Skipping invalid entry in ${harInfo.filename}:`, e.message);
       }
     }
   }
 }
 
+/**
+ * Creates a flat list of loaded endpoints for the popup UI.
+ */
 function getEndpointListData() {
   const endpoints = [];
   for (const [method, pathMap] of harDataMap.entries()) {
     for (const [path, state] of pathMap.entries()) {
-      endpoints.push({method, path, count: state.entries.length, currentIndex: state.currentIndex});
+      endpoints.push({method, path, count: state.entries.length});
     }
   }
   endpoints.sort((a, b) => a.path.localeCompare(b.path) || a.method.localeCompare(b.method));
   return endpoints;
 }
 
-function broadcastUpdate() {
-  const endpoints = getEndpointListData();
-  const fileInfo = loadedHars.map(h => ({id: h.id, filename: h.filename}));
-  for (const port of activeTabs.values()) {
-    port.postMessage({type: 'fileListUpdate', files: fileInfo});
-    port.postMessage({type: 'endpointListUpdate', endpoints: endpoints});
+
+// --- Global Control & Debugger Logic ---
+
+/**
+ * Turns the global replay functionality on or off.
+ */
+async function toggleGlobalReplay(active) {
+  isReplayGloballyActive = active;
+  await chrome.storage.local.set({isReplayGloballyActive: active});
+  await updateIcon();
+  if (active) {
+    await attachToAllValidTabs();
+  } else {
+    await detachFromAllTabs();
+  }
+  chrome.runtime.sendMessage({type: 'globalStateUpdate', isReplayGloballyActive});
+}
+
+/**
+ * Updates the browser action icon to reflect the current state (on/off).
+ */
+async function updateIcon() {
+  const iconPath = isReplayGloballyActive ? 'icon_on.png' : 'icon_off.png';
+  await chrome.action.setIcon({path: iconPath});
+}
+
+/**
+ * Iterates through all open tabs and attaches the debugger to valid ones.
+ */
+async function attachToAllValidTabs() {
+  const tabs = await chrome.tabs.query({});
+  for (const tab of tabs) {
+    await attachDebugger(tab.id);
   }
 }
 
-// 插件启动时加载状态
-loadState();
+/**
+ * Detaches the debugger from all currently attached tabs.
+ */
+async function detachFromAllTabs() {
+  for (const tabId of Array.from(debugTargets)) {
+    await detachDebugger(tabId);
+  }
+}
 
-// --- 调试器和请求拦截逻辑 --- (此部分无改动)
+/**
+ * Checks if a URL is valid for debugging.
+ */
+function isValidUrl(url) {
+  return url && !url.startsWith('chrome://') && !url.startsWith('devtools://') && !url.startsWith('chrome-extension://');
+}
+
+/**
+ * Attaches the debugger to a specific tab ID.
+ */
+async function attachDebugger(tabId) {
+  if (debugTargets.has(tabId)) return;
+  try {
+    await chrome.debugger.attach({tabId}, debuggerVersion);
+    await chrome.debugger.sendCommand({tabId}, "Fetch.enable", {patterns: [{urlPattern: "*"}]});
+    debugTargets.add(tabId);
+  } catch (e) {
+    console.warn(`Failed to attach debugger to tab ${tabId}: ${e.message}`);
+    // If attach fails during the redirect, we must clean up and redirect back.
+    const originalUrl = pendingNavigations.get(tabId);
+    if (originalUrl) {
+      pendingNavigations.delete(tabId);
+      navigationLock.delete(tabId); // Make sure lock is also released
+      await chrome.tabs.update(tabId, {url: originalUrl});
+    }
+  }
+}
+
+/**
+ * Detaches the debugger from a specific tab ID.
+ */
+async function detachDebugger(tabId) {
+  if (!debugTargets.has(tabId)) return;
+  try {
+    await chrome.debugger.detach({tabId});
+  } catch (e) {
+    console.warn(`Failed to detach debugger from tab ${tabId}: ${e.message}`);
+  } finally {
+    debugTargets.delete(tabId);
+  }
+}
+
+
+// --- Event Listeners ---
+
+chrome.runtime.onInstalled.addListener(loadInitialState);
+chrome.runtime.onStartup.addListener(loadInitialState);
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  (async () => {
+    switch (message.type) {
+      case 'getGlobalState':
+        sendResponse({
+          isReplayGloballyActive,
+          files: loadedHars,
+          endpoints: getEndpointListData()
+        });
+        break;
+      case 'toggleGlobalReplay':
+        await toggleGlobalReplay(message.active);
+        break;
+      case 'loadHar':
+        const newHar = {id: `har_${Date.now()}_${Math.random()}`, filename: message.filename};
+        loadedHars.push(newHar);
+        const dataResult = await chrome.storage.local.get('loadedHarsData');
+        const allHarData = dataResult.loadedHarsData || {};
+        allHarData[newHar.id] = message.data;
+        await chrome.storage.local.set({loadedHarsData: allHarData});
+        await saveState();
+        await rebuildHarDataMap();
+        chrome.runtime.sendMessage({type: 'fileListUpdate', files: loadedHars, endpoints: getEndpointListData()});
+        break;
+      case 'deleteHar':
+        loadedHars = loadedHars.filter(h => h.id !== message.id);
+        const deleteDataResult = await chrome.storage.local.get('loadedHarsData');
+        const allDeleteData = deleteDataResult.loadedHarsData || {};
+        delete allDeleteData[message.id];
+        await chrome.storage.local.set({loadedHarsData: allDeleteData});
+        await saveState();
+        await rebuildHarDataMap();
+        chrome.runtime.sendMessage({type: 'fileListUpdate', files: loadedHars, endpoints: getEndpointListData()});
+        break;
+    }
+  })();
+  return true; // Indicates async response
+});
+
+
+// --- Redirect Interception Listeners ---
+
+// 1. Catches navigation attempts before any request is made.
+chrome.webNavigation.onBeforeNavigate.addListener((details) => {
+  // If this tab is locked, it means we are programmatically redirecting it back. Do nothing.
+  if (navigationLock.has(details.tabId)) {
+    return;
+  }
+  // If replay is active, this is a top-level navigation, and the URL is valid...
+  if (isReplayGloballyActive && details.frameId === 0 && isValidUrl(details.url) && details.url !== loadingUrl) {
+    // ...and we are not already processing this tab...
+    if (pendingNavigations.has(details.tabId)) {
+      return;
+    }
+    // ...then save the target URL and redirect to our loading page.
+    pendingNavigations.set(details.tabId, details.url);
+    chrome.tabs.update(details.tabId, {url: loadingUrl});
+    attachDebugger(details.tabId);
+  }
+});
+
+// 2. Catches when our loading page has finished loading.
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (changeInfo.status === 'complete' && tab.url === loadingUrl) {
+    const originalUrl = pendingNavigations.get(tabId);
+    if (originalUrl) {
+      pendingNavigations.delete(tabId);
+      // LOCK the tab to prevent onBeforeNavigate from re-intercepting.
+      navigationLock.add(tabId);
+      await chrome.tabs.update(tabId, {url: originalUrl});
+    }
+  }
+});
+
+// 3. Catches when the *final* navigation is complete to release the lock.
+chrome.webNavigation.onCompleted.addListener((details) => {
+  if (navigationLock.has(details.tabId)) {
+    // UNLOCK the tab so future navigations by the user can be intercepted.
+    navigationLock.delete(details.tabId);
+  }
+});
+
+// 4. Cleans up all state if a tab is closed.
+chrome.tabs.onRemoved.addListener((tabId) => {
+  pendingNavigations.delete(tabId);
+  navigationLock.delete(tabId);
+  detachDebugger(tabId);
+});
+
+
+// --- Core Replay Logic ---
+
 chrome.debugger.onEvent.addListener(async (source, method, params) => {
   if (method !== 'Fetch.requestPaused') return;
   const {requestId, request} = params;
   const tabId = source.tabId;
   try {
     const urlObject = new URL(request.url);
+    // Special handling for localhost previews, which might have a different hostname but same path.
+    const path = (urlObject.hostname === 'localhost' && urlObject.port === '3000')
+      ? urlObject.pathname
+      : new URL(request.url).pathname;
+
     const methodUpper = request.method.toUpperCase();
-    const replayState = harDataMap.get(methodUpper)?.get(urlObject.pathname);
+    const replayState = harDataMap.get(methodUpper)?.get(path);
+
     if (!replayState || replayState.entries.length === 0) {
       await chrome.debugger.sendCommand({tabId}, "Fetch.continueRequest", {requestId});
       return;
     }
+
     const {entries, currentIndex} = replayState;
     const entry = entries[currentIndex];
+    // Cycle to the next response for the next time this endpoint is called.
     replayState.currentIndex = (currentIndex + 1) % entries.length;
+
     const response = entry.response;
     const headers = response.headers
       .filter(h => !['content-encoding', 'transfer-encoding', 'connection', 'content-length'].includes(h.name.toLowerCase()))
       .map(h => ({name: h.name, value: h.value}));
+
     let body = '';
     if (response.content?.text) {
       body = response.content.encoding === 'base64' ? response.content.text : btoa(unescape(encodeURIComponent(response.content.text)));
     }
+
     await chrome.debugger.sendCommand({tabId}, "Fetch.fulfillRequest", {
       requestId,
       responseCode: response.status,
@@ -114,107 +309,9 @@ chrome.debugger.onEvent.addListener(async (source, method, params) => {
   } catch (e) {
     console.error("Error during replay:", e);
     try {
+      // Attempt to continue the request to prevent the page from hanging.
       await chrome.debugger.sendCommand({tabId}, "Fetch.continueRequest", {requestId});
-    } catch (continueError) {
-      console.error("Failed to continue original request after error:", continueError);
+    } catch (continueError) { /* ignore */
     }
   }
-});
-
-// --- 与 DevTools 面板通信 ---
-chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== 'devtools-panel') return;
-  let tabId;
-
-  const messageHandler = async (message) => {
-    tabId = message.tabId || tabId;
-    if (!tabId) return;
-
-    switch (message.type) {
-      case 'init':
-        activeTabs.set(tabId, port);
-        let canDebug = false;
-        try {
-          const tab = await chrome.tabs.get(tabId);
-          // [MODIFIED] Check if the URL is debuggable
-          if (tab && tab.url && !tab.url.startsWith('chrome://') && !tab.url.startsWith('devtools://') && !tab.url.startsWith('chrome-extension://')) {
-            canDebug = true;
-          }
-        } catch (e) {
-          console.warn(`Could not get tab info for tabId ${tabId}`, e);
-        }
-
-        // [MODIFIED] Send the 'canDebug' flag along with the status
-        port.postMessage({
-          type: 'statusUpdate',
-          replayActive: debugTargets.has(tabId),
-          canDebug: canDebug
-        });
-        port.postMessage({
-          type: 'fileListUpdate',
-          files: loadedHars.map(h => ({id: h.id, filename: h.filename}))
-        });
-        port.postMessage({
-          type: 'endpointListUpdate',
-          endpoints: getEndpointListData()
-        });
-        break;
-
-      case 'toggleReplay':
-        // The safety check here is now a fallback, the UI should prevent this call.
-        const currentTab = await chrome.tabs.get(tabId);
-        if (!currentTab.url || currentTab.url.startsWith('chrome://') || currentTab.url.startsWith('devtools://') || currentTab.url.startsWith('chrome-extension://')) {
-          // Fails silently, the UI is already disabled.
-          console.warn("Attempted to toggle replay on a non-debuggable page. Ignored.");
-          port.postMessage({type: 'statusUpdate', replayActive: false, canDebug: false});
-          return;
-        }
-
-        if (message.active) {
-          try {
-            await chrome.debugger.attach({tabId}, debuggerVersion);
-            await chrome.debugger.sendCommand({tabId}, "Fetch.enable", {patterns: [{urlPattern: "*"}]});
-            debugTargets.add(tabId);
-          } catch (e) {
-            port.postMessage({type: 'statusUpdate', replayActive: false, canDebug: true});
-            return;
-          }
-        } else {
-          if (debugTargets.has(tabId)) {
-            await chrome.debugger.detach({tabId});
-            debugTargets.delete(tabId);
-          }
-        }
-        port.postMessage({type: 'statusUpdate', replayActive: debugTargets.has(tabId), canDebug: true});
-        break;
-      case 'loadHar':
-        // ... (此 case 无改动)
-        const newHar = { id: `har_${Date.now()}_${Math.random()}`, filename: message.filename };
-        loadedHars.push(newHar);
-        const dataResult = await chrome.storage.local.get('loadedHarsData');
-        const allHarData = dataResult.loadedHarsData || {};
-        allHarData[newHar.id] = message.data;
-        await chrome.storage.local.set({ loadedHarsData: allHarData });
-        await saveState();
-        await rebuildHarDataMap();
-        broadcastUpdate(); // 广播给所有面板
-        break;
-      case 'deleteHar':
-        // ... (此 case 无改动)
-        loadedHars = loadedHars.filter(h => h.id !== message.id);
-        await saveState();
-        await rebuildHarDataMap();
-        broadcastUpdate(); // 广播给所有面板
-        break;
-    }
-  };
-  port.onMessage.addListener(messageHandler);
-  port.onDisconnect.addListener(async () => {
-    if (tabId && debugTargets.has(tabId)) {
-      await chrome.debugger.detach({ tabId });
-      debugTargets.delete(tabId);
-    }
-    activeTabs.delete(tabId);
-    port.onMessage.removeListener(messageHandler);
-  });
 });
